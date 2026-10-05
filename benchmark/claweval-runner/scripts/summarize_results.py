@@ -33,6 +33,9 @@ Usage:
 
     # Output as CSV to file
     python scripts/summarize_results.py --format csv --output results.csv
+
+    # Group tasks by difficulty instead of the per-task view
+    python scripts/summarize_results.py --group-by difficulty
 """
 
 import argparse
@@ -186,6 +189,128 @@ def fmt(val):
     return str(val)
 
 
+GROUP_BY_CHOICES = ["difficulty"]
+GROUP_UNKNOWN_LABEL = "unknown"
+KNOWN_DIFFICULTY_ORDER = {"easy": 0, "medium": 1, "hard": 2}
+
+
+def fail(message: str):
+    """Print a clear error and exit without writing any output file."""
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def validate_grouped_source(data, source: Path):
+    """Validate the source shape required by the grouped view."""
+    if not isinstance(data, list):
+        fail(f"grouped view requires {source} to contain a JSON list of task objects")
+    for task in data:
+        if not isinstance(task, dict):
+            fail(f"grouped view requires every entry of {source} to be a JSON object")
+        task_id = task.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            fail(f"grouped view requires a non-empty string 'task_id' in task {json.dumps(task, ensure_ascii=False)[:80]}")
+        trials = task.get("trials")
+        if not isinstance(trials, list):
+            fail(f"grouped view requires 'trials' to be a list in task '{task_id}'")
+        for trial in trials:
+            if not isinstance(trial, dict):
+                fail(f"grouped view requires every trial of task '{task_id}' to be a JSON object")
+
+
+def _is_number(val) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+
+def _is_errored(trial: dict) -> bool:
+    return bool(trial.get("error"))
+
+
+def _difficulty_group_key(label):
+    text = str(label).strip() if label is not None else ""
+    if not text or text == GROUP_UNKNOWN_LABEL:
+        return (len(KNOWN_DIFFICULTY_ORDER) + 1, GROUP_UNKNOWN_LABEL)
+    rank = KNOWN_DIFFICULTY_ORDER.get(text.lower())
+    if rank is not None:
+        return (rank, text)
+    return (len(KNOWN_DIFFICULTY_ORDER), text)
+
+
+def _difficulty_group_label(task: dict) -> str:
+    label = task.get("difficulty")
+    if label is None:
+        return GROUP_UNKNOWN_LABEL
+    text = str(label).strip()
+    return text or GROUP_UNKNOWN_LABEL
+
+
+def _format_rate(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return ""
+    return f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)"
+
+
+def _format_mean(values: list[float], decimals: int, trim: bool = False) -> str:
+    if not values:
+        return ""
+    mean = sum(values) / len(values)
+    text = f"{mean:.{decimals}f}"
+    if trim:
+        text = text.rstrip("0").rstrip(".")
+    return f"{text} (n={len(values)})"
+
+
+def build_grouped_rows(data):
+    """Build one summary row per difficulty cohort, trial-weighted.
+
+    Errored trials are excluded from measured rates and means; unavailable
+    measurements stay blank instead of being treated as zero.
+    """
+    header = [
+        "Group", "Tasks", "Trials", "Errors", "Measured Trials", "Passed",
+        "Pass Rate", "Mean Score", "Mean Wall Time(s)",
+    ]
+    groups: dict[str, dict] = {}
+    for task in data:
+        label = _difficulty_group_label(task)
+        group = groups.setdefault(
+            label,
+            {"tasks": 0, "trials": 0, "errors": 0, "measured": 0,
+             "passed": 0, "scores": [], "walls": []},
+        )
+        group["tasks"] += 1
+        for trial in task.get("trials", []):
+            group["trials"] += 1
+            if _is_errored(trial):
+                group["errors"] += 1
+                continue
+            group["measured"] += 1
+            if trial.get("passed") is True:
+                group["passed"] += 1
+            score = trial.get("task_score")
+            if _is_number(score):
+                group["scores"].append(score)
+            wall = trial.get("wall_time_s")
+            if _is_number(wall):
+                group["walls"].append(wall)
+
+    rows = [header]
+    for label in sorted(groups, key=_difficulty_group_key):
+        group = groups[label]
+        rows.append([
+            label,
+            str(group["tasks"]),
+            str(group["trials"]),
+            str(group["errors"]),
+            str(group["measured"]),
+            str(group["passed"]),
+            _format_rate(group["passed"], group["measured"]),
+            _format_mean(group["scores"], 4, trim=True),
+            _format_mean(group["walls"], 2),
+        ])
+    return rows, groups
+
+
 def build_table(data, reports: dict | None = None):
     # Sort tasks alphabetically by task_id
     sorted_data = sorted(data, key=lambda t: t["task_id"])
@@ -295,6 +420,8 @@ def main():
                         help="Directory containing per-trial JSON reports (from generate_trial_reports.py)")
     parser.add_argument("-f", "--format", choices=["table", "csv"], default="table",
                         help="Output format (default: table)")
+    parser.add_argument("--group-by", choices=GROUP_BY_CHOICES, default=None,
+                        help="Group tasks by a cohort label (e.g. difficulty) instead of the default per-task view")
     parser.add_argument("-o", "--output", default=None,
                         help="Output file path (default: stdout)")
     args = parser.parse_args()
@@ -307,25 +434,41 @@ def main():
         print(f"Loaded {len(reports)} trial reports from: {args.report_dir}", file=sys.stderr)
 
     data = load_data(input_file)
-    rows = build_table(data, reports)
 
-    if args.format == "csv":
-        output = render_csv(rows)
+    if args.group_by:
+        validate_grouped_source(data, input_file)
+        rows, groups = build_grouped_rows(data)
+        if args.format == "csv":
+            output = render_csv(rows)
+        else:
+            output = render_table(rows)
+            total_tasks = sum(g["tasks"] for g in groups.values())
+            total_trials = sum(g["trials"] for g in groups.values())
+            total_errors = sum(g["errors"] for g in groups.values())
+            output += (
+                f"\n\nSummary: {len(groups)} groups, {total_tasks} tasks, "
+                f"{total_trials} trials ({total_errors} errored)\n"
+            )
     else:
-        output = render_table(rows)
-        # Summary stats for table mode
-        total_tasks = len(data)
-        passed_tasks = sum(1 for t in data if t.get("avg_passed"))
-        total_trials = sum(len(t.get("trials", [])) for t in data)
-        passed_trials = sum(
-            sum(1 for tr in t.get("trials", []) if tr.get("passed"))
-            for t in data
-        )
-        output += f"\n\nSummary: {total_tasks} tasks, {passed_tasks} passed ({passed_tasks/total_tasks*100:.1f}%)\n"
-        output += f"Trials: {total_trials} total, {passed_trials} passed ({passed_trials/total_trials*100:.1f}%)\n"
+        rows = build_table(data, reports)
+
+        if args.format == "csv":
+            output = render_csv(rows)
+        else:
+            output = render_table(rows)
+            # Summary stats for table mode
+            total_tasks = len(data)
+            passed_tasks = sum(1 for t in data if t.get("avg_passed"))
+            total_trials = sum(len(t.get("trials", [])) for t in data)
+            passed_trials = sum(
+                sum(1 for tr in t.get("trials", []) if tr.get("passed"))
+                for t in data
+            )
+            output += f"\n\nSummary: {total_tasks} tasks, {passed_tasks} passed ({passed_tasks/total_tasks*100:.1f}%)\n"
+            output += f"Trials: {total_trials} total, {passed_trials} passed ({passed_trials/total_trials*100:.1f}%)\n"
 
     if args.output:
-        with open(args.output, "w") as f:
+        with open(args.output, "w", encoding="utf-8") as f:
             f.write(output)
         print(f"Written to {args.output}")
     else:

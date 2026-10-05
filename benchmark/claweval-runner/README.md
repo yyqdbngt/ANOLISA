@@ -192,7 +192,7 @@ Core logic: `src/ce_runner/tool_injector.py`
 | `scripts/list_tasks.py` | List tasks grouped by prefix (T/M/C) and difficulty |
 | `scripts/debug_task.py` | Single-task interactive debug with verbose output |
 | `scripts/analyze.py` | Analyze batch trace artifacts |
-| `scripts/summarize_results.py` | Summarize batch results across runs |
+| `scripts/summarize_results.py` | Summarize batch results across runs (`--group-by difficulty` for cohort view) |
 | `scripts/generate_trial_reports.py` | Generate per-trial detailed reports |
 | `scripts/prompt_task.py` | Display the system prompt for a given task |
 | `scripts/check_api_key.py` | Test API key connectivity |
