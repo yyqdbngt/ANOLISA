@@ -57,8 +57,10 @@ impl Parser {
         // before any stateless heuristic: a read that continues a frame split
         // across TLS records starts inside a payload and can look like
         // anything, so it would never match the frame detection below.
+        let mut already_parsed_as_http2 = false;
         if self.http2_parser.is_tracking(&ssl_event) {
             let frames = self.http2_parser.parse(ssl_event.clone());
+            already_parsed_as_http2 = true;
             if !frames.is_empty() {
                 return ParseResult {
                     messages: vec![ParsedMessage::Http2Frames(frames)],
@@ -84,8 +86,14 @@ impl Parser {
             }
         }
 
-        // 2. HTTP/2 detection (binary frame protocol)
-        if ssl_event.is_http2() {
+        // 2. HTTP/2 detection (binary frame protocol). A read already consumed
+        // by the state-routed parse above must not be parsed a second time:
+        // `Http2Parser::parse` folds the read's bytes into the per-connection
+        // reassembly buffer, so a second call would duplicate them — a payload
+        // fragment whose leading bytes happen to look like a frame header was
+        // then emitted as a bogus frame and the true split frame reassembled
+        // from duplicated bytes.
+        if !already_parsed_as_http2 && ssl_event.is_http2() {
             let frames = self.http2_parser.parse(ssl_event.clone());
             if !frames.is_empty() {
                 return ParseResult {
@@ -404,5 +412,70 @@ mod tests {
         assert!(frames[0].is_data());
         assert_eq!(frames[0].stream_id, 3);
         assert_eq!(frames[0].payload(), payload);
+    }
+
+    #[test]
+    fn tracked_continuation_is_not_parsed_twice() {
+        // A continuation read on a tracked HTTP/2 connection that still yields
+        // no complete frame falls through to the stateless detection below.
+        // That second `parse` call folds the same read's bytes into the
+        // reassembly buffer a second time, so a payload fragment whose leading
+        // bytes happen to look like a small frame header was emitted as a
+        // bogus frame — and the true split frame then reassembled from the
+        // duplicated bytes, corrupting the call's body.
+        let parser = Parser::new();
+        let payload: Vec<u8> = (0u8..40).collect();
+        // A DATA frame header declaring 40 payload bytes, plus the first 8
+        // payload bytes: the frame is still incomplete after this read.
+        let mut partial_data = vec![0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03];
+        partial_data.extend_from_slice(&payload[..8]);
+        let mut first = h2_frame(4, 0x00, 0, &[]);
+        first.extend_from_slice(&partial_data);
+
+        let first = parser.parse_ssl_event(make_ssl_event(first));
+        assert!(
+            matches!(
+                &first.messages[..],
+                [ParsedMessage::Http2Frames(frames)] if frames.len() == 1 && frames[0].is_settings()
+            ),
+            "first read must emit only the SETTINGS frame, got {:?}",
+            first.messages
+        );
+
+        // The continuation starts inside the payload. Its first nine bytes are
+        // payload bytes that look like a small frame header (type <= 9, high
+        // stream-id bit clear, 9 + length <= buffer), so the stateless gate
+        // fires — while the merged buffer is still short of the declared 40
+        // payload bytes, so the state-routed parse yields no frame.
+        let mut second = vec![0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03];
+        second.extend_from_slice(&payload[8..23]);
+
+        let second_read = second.clone();
+        let second = parser.parse_ssl_event(make_ssl_event(second));
+        assert!(
+            !second
+                .messages
+                .iter()
+                .any(|m| matches!(m, ParsedMessage::Http2Frames(_))),
+            "a read already consumed by the state-routed parse must not be re-parsed as HTTP/2, got {:?}",
+            second.messages
+        );
+
+        // The final fragment must complete the frame from the wire bytes: the
+        // true payload is whatever followed the header on the wire, exactly
+        // once each — not the duplicated bytes the second parse produced.
+        let mut expected_payload = payload[..8].to_vec();
+        expected_payload.extend_from_slice(&second_read);
+        expected_payload.extend_from_slice(&payload[23..31]);
+        let third = parser.parse_ssl_event(make_ssl_event(payload[23..].to_vec()));
+        assert!(
+            third.messages.iter().any(|m| matches!(
+                m,
+                ParsedMessage::Http2Frames(frames)
+                    if frames.iter().any(|f| f.is_data() && f.payload() == expected_payload)
+            )),
+            "the split frame must complete with its wire payload, got {:?}",
+            third.messages
+        );
     }
 }
