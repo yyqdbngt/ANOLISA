@@ -22,10 +22,21 @@ def merge(json_str, config_path):
         print(f"ERROR: Invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
+    if not isinstance(new, dict):
+        print(f"ERROR: Input JSON must be an object, got {type(new).__name__}", file=sys.stderr)
+        sys.exit(1)
+
     servers = new.get("mcpServers", {})
     if not servers:
         print("ERROR: No mcpServers found in input", file=sys.stderr)
         sys.exit(1)
+    if not isinstance(servers, dict):
+        print(f"ERROR: mcpServers must be an object, got {type(servers).__name__}", file=sys.stderr)
+        sys.exit(1)
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            print(f"ERROR: mcpServers[{name!r}] must be an object, got {type(cfg).__name__}", file=sys.stderr)
+            sys.exit(1)
 
     # Read existing config
     existing = {}
@@ -39,13 +50,19 @@ def merge(json_str, config_path):
     if not isinstance(existing, dict):
         existing = {}
 
-    # Merge
-    if "mcpServers" not in existing:
+    # Merge. An existing mcpServers of the wrong shape (a corrupt or
+    # hand-edited file) cannot be merged into, so start fresh rather than
+    # crashing; the same applies to the mcp section below.
+    if not isinstance(existing.get("mcpServers"), dict):
+        if "mcpServers" in existing:
+            print(f"WARNING: {config_path} mcpServers is not an object; replacing it", file=sys.stderr)
         existing["mcpServers"] = {}
     existing["mcpServers"].update(servers)
 
     if "mcp" in new and isinstance(new["mcp"], dict):
-        if "mcp" not in existing:
+        if not isinstance(existing.get("mcp"), dict):
+            if "mcp" in existing:
+                print(f"WARNING: {config_path} mcp is not an object; replacing it", file=sys.stderr)
             existing["mcp"] = {}
         existing["mcp"].update(new["mcp"])
 
@@ -76,6 +93,9 @@ def check(config_path):
     if not servers:
         print(f"No mcpServers in {config_path}")
         return
+    if not isinstance(servers, dict):
+        print(f"ERROR: mcpServers must be an object, got {type(servers).__name__}", file=sys.stderr)
+        sys.exit(1)
 
     ok = True
     for name, cfg in servers.items():
