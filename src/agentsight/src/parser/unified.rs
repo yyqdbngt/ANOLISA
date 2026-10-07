@@ -8,6 +8,7 @@
 //! - `ProcessEventAggregator` for process events
 
 use super::{ParseResult, ParsedMessage};
+use crate::config::DEFAULT_CONNECTION_CAPACITY;
 use crate::event::Event;
 use crate::parser::http::{HttpParser, ParsedHttpMessage};
 use crate::parser::http2::Http2Parser;
@@ -16,7 +17,25 @@ use crate::parser::sse::{ParsedSseEvent, SseParser};
 use crate::probes::proctrace::VariableEvent;
 use crate::probes::sslsniff::SslEvent;
 use crate::runtime_metrics::StageTimer;
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
+
+/// Largest torn-line prefix retained per read-direction connection.
+///
+/// A TLS record caps at 16 KiB, so a line torn across two reads carries at
+/// most one record of prefix; 256 KiB leaves generous headroom for providers
+/// whose single usage/event lines exceed a record several times over while
+/// keeping the worst case (capacity connections x cap) a fraction of the
+/// aggregator's own continuation budget.
+const MAX_SSE_LINE_PREFIX_BYTES: usize = 256 * 1024;
+
+/// Read-direction connection identity for torn-SSE-line reassembly.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+struct SseLineKey {
+    pid: u32,
+    ssl_ptr: u64,
+}
 
 /// Unified parser for SSL and process events
 ///
@@ -26,6 +45,12 @@ pub struct Parser {
     http_parser: HttpParser,
     http2_parser: Http2Parser,
     sse_parser: SseParser,
+    /// Partial trailing SSE line per read-direction connection. The SSE
+    /// parser is stateless per read and a `data:` line torn by a TLS record
+    /// boundary was dropped with its whole event, so the prefix is retained
+    /// here and joined with the continuation read — the same reassembly the
+    /// HTTP/2 parser performs for split frames.
+    sse_line_prefixes: RefCell<lru::LruCache<SseLineKey, Vec<u8>>>,
 }
 
 impl Default for Parser {
@@ -37,11 +62,101 @@ impl Default for Parser {
 impl Parser {
     /// Create new parser
     pub fn new() -> Self {
+        // Clamp like the aggregator's caches: a zero capacity would otherwise
+        // panic instead of degrading to maximum eviction.
+        let capacity =
+            NonZeroUsize::new(DEFAULT_CONNECTION_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         Parser {
             http_parser: HttpParser::new(),
             http2_parser: Http2Parser::new(),
             sse_parser: SseParser::new(),
+            sse_line_prefixes: RefCell::new(lru::LruCache::new(capacity)),
         }
+    }
+
+    /// Retain the torn tail (bytes after the last newline) of a response
+    /// body that arrived with its headers, so [`Self::parse_sse_joined`] can
+    /// complete the line with the continuation read.
+    fn remember_sse_line_prefix(&self, response: &crate::parser::http::ParsedResponse) {
+        let event = &response.source_event;
+        let key = SseLineKey {
+            pid: event.pid,
+            ssl_ptr: event.ssl_ptr,
+        };
+        let body = response.body();
+        let tail = match body.iter().rposition(|&b| b == b'\n') {
+            Some(last_newline) => &body[last_newline + 1..],
+            None => body,
+        };
+        if tail.is_empty() || tail.len() > MAX_SSE_LINE_PREFIX_BYTES {
+            return;
+        }
+        self.sse_line_prefixes.borrow_mut().put(key, tail.to_vec());
+    }
+
+    /// Parse read-direction SSE bytes, completing a line torn across reads.
+    ///
+    /// `SseParser::parse` yields nothing for a line without its terminating
+    /// newline, so a `data:` line split across two SSL reads lost its entire
+    /// event: the continuation read started mid-line, parsed the following
+    /// complete lines, and the torn event's text, tool deltas and usage were
+    /// silently dropped. Retain the torn prefix per connection and join it
+    /// with the continuation before parsing; whatever remains after the last
+    /// newline is kept for the next read.
+    fn parse_sse_joined(&self, event: &Rc<SslEvent>) -> Vec<ParsedSseEvent> {
+        let key = SseLineKey {
+            pid: event.pid,
+            ssl_ptr: event.ssl_ptr,
+        };
+        let prefix = self.sse_line_prefixes.borrow_mut().pop(&key);
+        let source = match prefix {
+            Some(mut buffered) if !buffered.is_empty() => {
+                if buffered.len() + event.buf_size() as usize > MAX_SSE_LINE_PREFIX_BYTES {
+                    log::warn!(
+                        "SSE torn line exceeds {MAX_SSE_LINE_PREFIX_BYTES} bytes; dropping prefix | pid={} ssl_ptr={:#x}",
+                        key.pid,
+                        key.ssl_ptr,
+                    );
+                    Rc::clone(event)
+                } else {
+                    buffered.extend_from_slice(&event.buf[..event.buf_size() as usize]);
+                    let mut merged = (**event).clone();
+                    merged.buf = buffered;
+                    merged.len = merged.buf.len() as u32;
+                    Rc::new(merged)
+                }
+            }
+            _ => Rc::clone(event),
+        };
+
+        let events = self.sse_parser.parse(Rc::clone(&source));
+        let data = &source.buf[..source.buf_size() as usize];
+        let tail = match data.iter().rposition(|&b| b == b'\n') {
+            Some(last_newline) => &data[last_newline + 1..],
+            None => data,
+        };
+        if !tail.is_empty() {
+            if tail.len() <= MAX_SSE_LINE_PREFIX_BYTES {
+                self.sse_line_prefixes.borrow_mut().put(key, tail.to_vec());
+            } else {
+                log::warn!(
+                    "SSE torn line exceeds {MAX_SSE_LINE_PREFIX_BYTES} bytes; dropping prefix | pid={} ssl_ptr={:#x}",
+                    key.pid,
+                    key.ssl_ptr,
+                );
+            }
+        }
+        events
+    }
+
+    /// Drop the retained torn-line prefix for `event`'s connection: the SSE
+    /// stream has completed (chunked terminator or done marker), so a later
+    /// read on the same connection identity must not be joined onto it.
+    fn clear_sse_line_prefix(&self, event: &SslEvent) {
+        self.sse_line_prefixes.borrow_mut().pop(&SseLineKey {
+            pid: event.pid,
+            ssl_ptr: event.ssl_ptr,
+        });
     }
 
     /// Parse SSL event into messages
@@ -72,7 +187,17 @@ impl Parser {
                 Ok(msg) => {
                     let message = match msg {
                         ParsedHttpMessage::Request(req) => ParsedMessage::Request(req),
-                        ParsedHttpMessage::Response(resp) => ParsedMessage::Response(resp),
+                        ParsedHttpMessage::Response(resp) => {
+                            // The first response read may end inside a `data:`
+                            // line whose continuation arrives as a later read:
+                            // remember the torn tail so the SSE fallback above
+                            // can join it. Requests (write direction) never
+                            // carry an SSE response body.
+                            if ssl_event.rw == 0 && resp.is_sse() {
+                                self.remember_sse_line_prefix(&resp);
+                            }
+                            ParsedMessage::Response(resp)
+                        }
                     };
                     return ParseResult {
                         messages: vec![message],
@@ -145,7 +270,9 @@ impl Parser {
                         ssl_ptr: ssl_event.ssl_ptr,
                     };
                     let trimmed = Rc::new(trimmed);
-                    let prefix_events = self.sse_parser.parse(Rc::clone(&trimmed));
+                    // Join a line torn by the previous read boundary
+                    // first, exactly like the plain-SSE fallback below.
+                    let prefix_events = self.parse_sse_joined(&trimmed);
                     if prefix_events.is_empty() {
                         // Not SSE text: for a compressed body these are the
                         // last compressed bytes, which only the aggregator's
@@ -166,6 +293,10 @@ impl Parser {
                 messages.push(ParsedMessage::SseEvent(ParsedSseEvent::new_done_marker(
                     Rc::clone(&ssl_event),
                 )));
+                // The terminator ends this SSE stream: a torn prefix the
+                // joined parse still retained must not leak into whatever
+                // the connection carries next.
+                self.clear_sse_line_prefix(&ssl_event);
 
                 return ParseResult { messages };
             }
@@ -183,8 +314,14 @@ impl Parser {
             };
         }
 
-        // 4. Fallback: SSE data (read-direction only)
-        let sse_events = self.sse_parser.parse(ssl_event.clone());
+        // 4. Fallback: SSE data (read-direction only), completing a line torn
+        // by the previous read boundary from the retained prefix.
+        let sse_events = self.parse_sse_joined(&ssl_event);
+        if sse_events.iter().any(ParsedSseEvent::is_done) {
+            // The done marker completes this SSE stream: drop any retained
+            // torn prefix so the next stream on the connection starts clean.
+            self.clear_sse_line_prefix(&ssl_event);
+        }
         if sse_events.is_empty() {
             // No SSE events could be parsed from this read-direction chunk.
             // This happens when the SSE stream is compressed (gzip/zstd/br):
