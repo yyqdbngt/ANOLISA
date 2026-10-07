@@ -30,6 +30,8 @@ def _wanx(prompt, model, size, key):
         with urllib.request.urlopen(req,timeout=60) as r: res = json.loads(r.read())
     except urllib.error.HTTPError as e:
         print(f"ERROR: HTTP {e.code} {e.read().decode() if e.readable() else ''}",file=sys.stderr); sys.exit(1)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"ERROR: cannot reach {url}: {e}",file=sys.stderr); sys.exit(1)
     tid = res.get("output",{}).get("task_id")
     if not tid: print(f"ERROR: {json.dumps(res)}",file=sys.stderr); sys.exit(1)
     print(f"Task: {tid}",file=sys.stderr)
@@ -37,7 +39,18 @@ def _wanx(prompt, model, size, key):
     for i in range(120):
         time.sleep(2)
         req = urllib.request.Request(f"https://dashscope.aliyuncs.com/api/v1/tasks/{tid}",headers=ph)
-        with urllib.request.urlopen(req,timeout=30) as r: st = json.loads(r.read())
+        # The task keeps running server-side: a transient transport error
+        # between two polls (connection reset, read timeout) must ride over
+        # within the loop's bounded budget instead of killing the script
+        # after the task was already submitted. HTTP errors surface the
+        # server's verdict and stay fatal.
+        try:
+            with urllib.request.urlopen(req,timeout=30) as r: st = json.loads(r.read())
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            print(f"poll retry after transient error: {e}",file=sys.stderr)
+            continue
         s = st.get("output",{}).get("task_status","")
         if s == "SUCCEEDED":
             rs = st["output"].get("results",[])
