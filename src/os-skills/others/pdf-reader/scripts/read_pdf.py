@@ -13,14 +13,24 @@ def _install():
         import pymupdf; return pymupdf
 
 def _pages(spec, total):
+    # Tolerant parse: an LLM caller routinely passes a trailing comma, an
+    # empty range end ("1-"), or a stray token. Crashing with a ValueError
+    # traceback lost the whole extraction; skip the bad token instead.
     ps = set()
     for p in spec.split(","):
         p = p.strip()
-        if "-" in p:
-            a, b = p.split("-",1); [ps.add(i) for i in range(max(0,int(a)-1), min(total,int(b)))]
-        else:
-            i = int(p)-1
-            if 0 <= i < total: ps.add(i)
+        if not p:
+            continue
+        try:
+            if "-" in p:
+                a, b = p.split("-", 1)
+                ps.update(range(max(0, int(a) - 1), min(total, int(b))))
+            else:
+                i = int(p) - 1
+                if 0 <= i < total:
+                    ps.add(i)
+        except ValueError:
+            print(f"WARNING: skipping invalid page token {p!r}", file=sys.stderr)
     return sorted(ps)
 
 def _page_tables(page):
