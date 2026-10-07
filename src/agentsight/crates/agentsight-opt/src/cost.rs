@@ -811,7 +811,19 @@ fn trunc(s: &str, n: usize) -> String {
 /// the forms that change the working tree (`git stash`, `pop`, `drop`, …)
 /// remain backtracks.
 fn is_backtrack_cmd(cmd: &str) -> bool {
-    let c = cmd.to_lowercase();
+    // A compound command runs each segment, so each segment is judged on its
+    // own: `git stash list && git stash pop` reads the stash (no-op) but the
+    // `pop` half is a real reversal, while the exclusion rules (`git checkout
+    // -b`, `git stash list/show`) must still see the form they exclude within
+    // its own segment. Judging the whole string let one no-op segment veto a
+    // reversal hidden in another.
+    cmd.split(['\n', ';', '&', '|'])
+        .any(is_backtrack_segment)
+}
+
+/// Whether one shell command segment looks like a backtrack / dead-end reversal.
+fn is_backtrack_segment(segment: &str) -> bool {
+    let c = segment.to_lowercase();
     let checkout = c.contains("git checkout") && !c.contains("git checkout -b");
     let stash =
         c.contains("git stash") && !c.contains("git stash list") && !c.contains("git stash show");
@@ -2195,6 +2207,18 @@ mod tests {
         assert!(is_backtrack_cmd("git checkout -- src/lib.rs"));
         assert!(is_backtrack_cmd("git checkout ."));
         assert!(is_backtrack_cmd("git reset --hard HEAD~1"));
+        // Compound commands are judged per segment: a no-op segment must not
+        // veto a reversal that runs in another segment of the same command.
+        // `git stash list && git stash pop` reads the stash and then applies
+        // it — the whole-string match saw `git stash list` and stayed quiet,
+        // so the turn's real 回退 was missed.
+        assert!(is_backtrack_cmd("git stash list && git stash pop"));
+        assert!(is_backtrack_cmd("git stash show -p; git stash drop"));
+        assert!(is_backtrack_cmd("git checkout -b triage && git checkout main"));
+        assert!(is_backtrack_cmd("make test\ngit revert HEAD"));
+        // A no-op compound stays a no-op: every segment is excluded.
+        assert!(!is_backtrack_cmd("git stash list && git stash show -p"));
+        assert!(!is_backtrack_cmd("cd /repo && git checkout -b fix/parse"));
         // `git clean` discards untracked files — a working-tree rewind.
         assert!(is_backtrack_cmd("git clean -fd"));
         assert!(is_backtrack_cmd("git clean -n"));
