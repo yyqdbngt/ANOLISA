@@ -154,6 +154,16 @@ def resolve_task_id(trace_filename: str) -> str:
     return parts[0] if len(parts) == 2 else base
 
 
+def _text_clip(value, limit: int) -> str:
+    """Truncate a YAML field that may be missing, null, or a non-string.
+
+    A task.yaml may carry `prompt:` null, `prompt` as a plain string, or a
+    null `reference_solution`; slicing those raises and used to abort the
+    whole report run after some reports were already written.
+    """
+    return value[:limit] if isinstance(value, str) else ""
+
+
 def load_task_info(task_id: str, tasks_dir: str) -> dict:
     """Load task.yaml and extract relevant fields."""
     yaml_path = os.path.join(tasks_dir, task_id, "task.yaml")
@@ -161,17 +171,20 @@ def load_task_info(task_id: str, tasks_dir: str) -> dict:
         return {"task_id": task_id, "error": f"task.yaml not found"}
 
     with open(yaml_path) as f:
-        data = yaml.safe_load(f)
+        data = yaml.safe_load(f) or {}
+
+    prompt = data.get("prompt")
+    prompt_text = prompt.get("text", "") if isinstance(prompt, dict) else ""
 
     return {
         "task_id": data.get("task_id", task_id),
         "task_name": data.get("task_name", ""),
         "category": data.get("category", ""),
         "difficulty": data.get("difficulty", ""),
-        "prompt": data.get("prompt", {}).get("text", "")[:300],
+        "prompt": _text_clip(prompt_text, 300),
         "scoring_components": data.get("scoring_components", []),
-        "judge_rubric": data.get("judge_rubric", ""),
-        "reference_solution": data.get("reference_solution", "")[:300],
+        "judge_rubric": data.get("judge_rubric") or "",
+        "reference_solution": _text_clip(data.get("reference_solution"), 300),
         "primary_dimensions": data.get("primary_dimensions", []),
     }
 
