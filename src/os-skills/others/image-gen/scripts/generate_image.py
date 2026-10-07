@@ -11,13 +11,18 @@ def _key():
     for cfg in [os.path.expanduser("~/.openclaw/openclaw.json")]:
         try:
             with open(cfg) as f: c = json.loads(f.read())
+            if not isinstance(c, dict):
+                raise ValueError(f"{cfg} is not a JSON object")
             # 格式1: {"providers":{"dashscope":{"apiKey":"..."}}}
-            for p in (c.get("providers") or {}).values():
+            providers = c.get("providers")
+            for p in (providers.values() if isinstance(providers, dict) else []):
                 if isinstance(p,dict) and p.get("apiKey"): return p["apiKey"]
             # 格式2: {"models":{"providers":{"xxx":{"apiKey":"..."}}}}
-            for p in (c.get("models",{}).get("providers") or {}).values():
+            models = c.get("models")
+            nested = models.get("providers") if isinstance(models, dict) else None
+            for p in (nested.values() if isinstance(nested, dict) else []):
                 if isinstance(p,dict) and p.get("apiKey"): return p["apiKey"]
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, OSError):
             pass
     print("ERROR: No API key. Set DASHSCOPE_API_KEY or configure ~/.openclaw/openclaw.json",file=sys.stderr); sys.exit(1)
 
