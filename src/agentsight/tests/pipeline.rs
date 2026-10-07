@@ -183,9 +183,24 @@ fn assistant_text(call: &agentsight::genai::LLMCall) -> String {
         .collect()
 }
 
+/// A pid with no live `/proc` entry.
+///
+/// `call_builder` resolves `process_name` from the *host's* `/proc/<pid>/comm`
+/// and falls back to the event comm only when that entry is unreadable. A
+/// hardcoded pid therefore asserts on whichever process happens to own it on
+/// the machine running the test: on one host pid 5000 was `gnome-shell`, and
+/// the test failed on `process_name` while passing everywhere pid 5000 is
+/// free. Pick a high pid with no `/proc` entry instead, so the fallback path
+/// under test is the one that actually runs.
+fn unused_pid() -> u32 {
+    (4_000_000u32..4_190_000)
+        .find(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .expect("a pid range with at least one unused pid")
+}
+
 #[test]
 fn test_openai_sse_pipeline() {
-    let pid = 5000u32;
+    let pid = unused_pid();
     let ssl_ptr = 0xA000u64;
     let comm = "node";
 
