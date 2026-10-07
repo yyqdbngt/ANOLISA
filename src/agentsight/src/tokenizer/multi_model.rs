@@ -373,7 +373,17 @@ mod tests {
     }"#;
 
     fn fixture_tokenizer() -> LlmTokenizer {
-        let dir = std::env::temp_dir().join(format!("agentsight-mm-tok-{}", std::process::id()));
+        // Every call gets its own directory: the tests run in parallel
+        // threads of one process, and a shared pid-keyed path let one
+        // thread's `fs::write` (open with O_TRUNC, then write) race
+        // another thread's `from_file`, which then read a truncated,
+        // empty tokenizer.json and failed with an EOF parse error.
+        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight-mm-tok-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         let tokenizer_path = dir.join("tokenizer.json");
         let config_path = dir.join("tokenizer_config.json");
