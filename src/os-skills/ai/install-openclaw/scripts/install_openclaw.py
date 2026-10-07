@@ -178,10 +178,16 @@ def ordered_unique(items):
 
 
 def merge_plugin_allow(existing, merged):
-    existing_allow = existing.get("plugins", {}).get("allow", [])
-    merged_allow = merged.get("plugins", {}).get("allow")
+    # A hand-edited config may hold a non-object `plugins` section; treat it
+    # as absent instead of crashing with an AttributeError deep in the merge.
+    existing_plugins = existing.get("plugins") if isinstance(existing.get("plugins"), dict) else {}
+    merged_plugins = merged.get("plugins") if isinstance(merged.get("plugins"), dict) else {}
+    existing_allow = existing_plugins.get("allow", [])
+    merged_allow = merged_plugins.get("allow")
     if merged_allow is None:
         return merged
+    if not isinstance(existing_allow, list):
+        existing_allow = []
 
     merged.setdefault("plugins", {})["allow"] = ordered_unique(
         [*existing_allow, *merged_allow]
@@ -535,6 +541,13 @@ def apply_config(config, config_path, *, dry_run=False):
                 existing = json.load(fh)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"Invalid JSON in {config_path}: {exc}") from exc
+        except (UnicodeDecodeError, OSError) as exc:
+            raise SystemExit(f"Cannot read {config_path}: {exc}") from exc
+        if not isinstance(existing, dict):
+            raise SystemExit(
+                f"Invalid config in {config_path}: expected a JSON object, "
+                f"got {type(existing).__name__}. Fix or remove the file and retry."
+            )
 
     merged = deep_merge(existing, config)
     merged = merge_plugin_allow(existing, merged)
