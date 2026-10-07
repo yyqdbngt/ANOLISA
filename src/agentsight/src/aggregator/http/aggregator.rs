@@ -1872,6 +1872,54 @@ mod tests {
     }
 
     #[test]
+    fn test_coalesced_interim_and_final_response_completes_the_call() {
+        // A server that answers without reading the body coalesces the interim
+        // `100 Continue` with its final response in one read. Peeling only the
+        // first response kept the pending-body state and returned — the final
+        // response sharing the read was silently dropped and the call never
+        // completed.
+        let mut aggregator = HttpConnectionAggregator::new();
+        let pid = 4322;
+        let ssl_ptr = 0xC100;
+        let body = br#"{"q":"why"}"#;
+
+        let headers = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let header_end = headers.len();
+        let request_event = create_mock_ssl_event_with_buf(pid, ssl_ptr, headers.into_bytes(), 1);
+        let request = ParsedRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            version: 11,
+            headers: HashMap::from([
+                ("content-length".to_string(), body.len().to_string()),
+                ("expect".to_string(), "100-continue".to_string()),
+            ]),
+            body_offset: header_end,
+            body_len: 0,
+            source_event: request_event,
+            reassembled_body: None,
+        };
+        aggregator.process_request(request);
+        assert!(matches!(
+            aggregator.connections.peek(&ConnectionId { pid, ssl_ptr }),
+            Some(ConnectionState::RequestBodyPending { .. })
+        ));
+
+        // One read: the interim response and the final one that answers the
+        // request without ever reading its body.
+        let coalesced = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let response_event = create_mock_ssl_event_with_buf(pid, ssl_ptr, coalesced, 0);
+        let result = aggregator.process_raw_body_data(&response_event);
+        let Some(AggregatedResult::HttpComplete(pair)) = result else {
+            panic!("expected HttpComplete from the coalesced read, got {result:?}");
+        };
+        assert_eq!(pair.response.status_code(), 413);
+    }
+
+    #[test]
     fn test_request_body_single_event_no_aggregation() {
         let mut aggregator = HttpConnectionAggregator::new();
 

@@ -327,7 +327,6 @@ impl HttpConnectionAggregator {
                 expected_body_len,
                 body_buffer,
             } => {
-                let assembly = PendingResponse::Headers(Rc::new(event.clone()));
                 // An interim 1xx response (`100 Continue`) does not answer the
                 // request: a client that sent `Expect: 100-continue` writes the
                 // body only after receiving it. Collapsing to RequestPending
@@ -335,19 +334,47 @@ impl HttpConnectionAggregator {
                 // body and every body continuation afterwards would hit the
                 // no-op fallback of `process_raw_body_data`, silently dropping
                 // the prompt. Keep the pending body state instead.
-                if matches!(
-                    assembly.parsed_headers(),
-                    Ok(Some(ref response)) if is_informational(response.status_code)
-                ) {
-                    self.insert(
-                        id,
-                        ConnectionState::RequestBodyPending {
-                            request,
-                            expected_body_len,
-                            body_buffer,
-                        },
+                //
+                // A read can carry the interim response and what follows it —
+                // a server that answered without reading the body often
+                // coalesces `100 Continue` with its `413`/`401` final response.
+                // Peel every leading interim response and hand the remainder to
+                // the same state machine; dropping it at the first interim lost
+                // the final response and the call never completed.
+                let mut current = Rc::new((*event).clone());
+                let assembly;
+                loop {
+                    let candidate = PendingResponse::Headers(Rc::clone(&current));
+                    let interim = matches!(
+                        candidate.parsed_headers(),
+                        Ok(Some(ref response)) if is_informational(response.status_code)
                     );
-                    return None;
+                    if !interim {
+                        assembly = candidate;
+                        break;
+                    }
+                    let rest = candidate
+                        .parsed_headers()
+                        .ok()
+                        .flatten()
+                        .map(|response| response.body().to_vec())
+                        .unwrap_or_default();
+                    if rest.is_empty() {
+                        // The body is still coming: keep the pending-body state.
+                        self.insert(
+                            id,
+                            ConnectionState::RequestBodyPending {
+                                request,
+                                expected_body_len,
+                                body_buffer,
+                            },
+                        );
+                        return None;
+                    }
+                    let mut next = (*current).clone();
+                    next.len = rest.len() as u32;
+                    next.buf = rest;
+                    current = Rc::new(next);
                 }
                 request.reassembled_body = Some(body_buffer);
                 (Some(request), assembly)
