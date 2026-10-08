@@ -49,7 +49,12 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         // oracle is the one OLTP database the canonical predicate already
         // counts (is_database_present); the THP rule counted it in 64bd828e0.
         // An Oracle-only host is an io-latency workload, not mixed.
-        || info.has_process("oracle");
+        || info.has_process("oracle")
+        // HBase is the distributed KV store the runtime marker table
+        // already resolves ("hbase" -> "hbase"): the io-latency profile is
+        // defined as "OLTP databases, KV stores", so an HBase-only host
+        // must not fall through to mixed.
+        || info.has_process("hbase");
     let has_cache = info.has_process("redis-server")
         // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
         // `valkey-server` binary with the same event-loop, memory-resident
@@ -270,6 +275,18 @@ mod tests {
         // A database still outranks the web tier on a combined host.
         assert_eq!(
             classify(&make_info(vec!["tidb-server", "nginx"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// The runtime marker table resolves hbase to "hbase"; a distributed KV
+    /// store is the io-latency profile's own definition, not mixed.
+    #[test]
+    fn test_classify_hbase() {
+        assert_eq!(classify(&make_info(vec!["hbase"])), WorkloadType::IoLatency);
+        // A database still outranks the web tier on a combined host.
+        assert_eq!(
+            classify(&make_info(vec!["hbase", "nginx"])),
             WorkloadType::IoLatency
         );
     }
